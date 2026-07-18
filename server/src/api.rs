@@ -166,7 +166,9 @@ pub async fn duplicate_config(
     }
 }
 
-pub async fn validate_config(
+/// Start a validation: spawn the job and return its id. The client then
+/// connects to the WebSocket to stream progress, same as a build.
+pub async fn start_validate(
     State(st): State<AppState>,
     Path(name): Path<String>,
     Query(q): Query<RefQuery>,
@@ -175,10 +177,100 @@ pub async fn validate_config(
         Ok(c) => c,
         Err(e) => return err(StatusCode::NOT_FOUND, e),
     };
-    match engine::validate_config(&st.repo, q.reference.as_deref(), &content).await {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => engine_err(e),
+
+    let id = st
+        .next_validate_id
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let (vtx, _) = broadcast::channel::<String>(1024);
+    st.live_validations.lock().await.insert(id, vtx.clone());
+
+    let repo = st.repo.clone();
+    let live = st.live_validations.clone();
+    let reference = q.reference;
+
+    tokio::spawn(async move {
+        run_validate_job(id, repo, reference, content, live, vtx).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "validate_id": id })),
+    )
+        .into_response()
+}
+
+/// Drive one validation: bridge engine log lines to the broadcast channel,
+/// then send a terminal marker with the outcome.
+async fn run_validate_job(
+    id: u64,
+    repo: engine::Repo,
+    reference: Option<String>,
+    content: String,
+    live: crate::LiveLogs,
+    vtx: broadcast::Sender<String>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let vtx_fwd = vtx.clone();
+    let forward = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            let _ = vtx_fwd.send(line);
+        }
+    });
+
+    let result = engine::validate_config(&repo, reference.as_deref(), &content, tx).await;
+    let _ = forward.await;
+
+    match result {
+        Ok(v) => {
+            let marker = if v.ok { "valid" } else { "invalid" };
+            let _ = vtx.send(format!("__VALIDATE_DONE__:{marker}"));
+        }
+        Err(e) => {
+            let _ = vtx.send(format!("ERROR: {e}"));
+            let _ = vtx.send("__VALIDATE_DONE__:error".to_string());
+        }
     }
+
+    live.lock().await.remove(&id);
+}
+
+/// WebSocket: stream a validation's progress live. Unlike build logs, there is
+/// nothing to replay once finished (validations aren't persisted) — connecting
+/// after the fact just gets an immediate close.
+pub async fn validate_log_ws(
+    ws: WebSocketUpgrade,
+    State(st): State<AppState>,
+    Path(id): Path<u64>,
+) -> Response {
+    ws.on_upgrade(move |socket| stream_validate_logs(socket, st, id))
+}
+
+async fn stream_validate_logs(mut socket: WebSocket, st: AppState, id: u64) {
+    let rx = st.live_validations.lock().await.get(&id).map(|tx| tx.subscribe());
+
+    if let Some(mut rx) = rx {
+        loop {
+            match rx.recv().await {
+                Ok(line) => {
+                    if let Some(rest) = line.strip_prefix("__VALIDATE_DONE__:") {
+                        let _ = socket
+                            .send(Message::Text(format!("[validate {rest}]")))
+                            .await;
+                        break;
+                    }
+                    if socket.send(Message::Text(line)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    } else {
+        let _ = socket.send(Message::Text("[validate finished]".into())).await;
+    }
+    let _ = socket.close().await;
 }
 
 pub async fn detect_config(State(st): State<AppState>, Path(name): Path<String>) -> Response {

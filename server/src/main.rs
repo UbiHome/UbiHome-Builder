@@ -9,6 +9,7 @@ mod assets;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use axum::routing::{get, post};
@@ -27,6 +28,11 @@ pub struct AppState {
     pub store: Store,
     pub repo: Repo,
     pub live: LiveLogs,
+    /// Live log channels for in-progress validations, keyed by validate id.
+    /// Validations aren't persisted (no history entry), so this is purely
+    /// in-memory, unlike `live` which mirrors rows in the build store.
+    pub live_validations: LiveLogs,
+    pub next_validate_id: Arc<AtomicU64>,
 }
 
 #[derive(Parser)]
@@ -68,6 +74,8 @@ async fn main() -> anyhow::Result<()> {
         store,
         repo,
         live: Arc::new(Mutex::new(HashMap::new())),
+        live_validations: Arc::new(Mutex::new(HashMap::new())),
+        next_validate_id: Arc::new(AtomicU64::new(1)),
     };
 
     let api = Router::new()
@@ -81,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
                 .put(api::update_config)
                 .delete(api::delete_config),
         )
-        .route("/configs/:name/validate", post(api::validate_config))
+        .route("/configs/:name/validate", post(api::start_validate))
         .route("/configs/:name/detect", post(api::detect_config))
         .route("/configs/:name/rename", post(api::rename_config))
         .route("/configs/:name/duplicate", post(api::duplicate_config))
@@ -91,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/builds/:id/log", get(api::get_build_log))
         .route("/builds/:id/logs", get(api::build_log_ws))
         .route("/builds/:id/artifact", get(api::download_artifact))
+        .route("/validations/:id/logs", get(api::validate_log_ws))
         .with_state(state.clone());
 
     let app = Router::new()

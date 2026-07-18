@@ -10,6 +10,7 @@
 //! Nothing shared is mutated.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
@@ -140,26 +141,33 @@ fn cargo_build_command(
     cmd
 }
 
-/// Stream a child process's stdout+stderr to `log` and wait for it to exit.
-async fn run_streaming(
+/// Stream a child process's stdout+stderr to `log`, wait for it to exit, and
+/// also return every line in arrival order (callers that only care about the
+/// exit status, like [`build`], simply ignore it).
+pub(crate) async fn run_streaming(
     mut child: tokio::process::Child,
     log: &UnboundedSender<String>,
-) -> Result<std::process::ExitStatus, BuilderError> {
+) -> Result<(std::process::ExitStatus, Vec<String>), BuilderError> {
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
+    let captured = Arc::new(StdMutex::new(Vec::new()));
 
     let log_out = log.clone();
+    let cap_out = captured.clone();
     let out_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let _ = log_out.send(line);
+            let _ = log_out.send(line.clone());
+            cap_out.lock().unwrap().push(line);
         }
     });
     let log_err = log.clone();
+    let cap_err = captured.clone();
     let err_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let _ = log_err.send(line);
+            let _ = log_err.send(line.clone());
+            cap_err.lock().unwrap().push(line);
         }
     });
 
@@ -169,7 +177,92 @@ async fn run_streaming(
         .map_err(|e| BuilderError::Build(format!("build process error: {e}")))?;
     let _ = out_task.await;
     let _ = err_task.await;
-    Ok(status)
+    let lines = Arc::try_unwrap(captured)
+        .expect("no other references remain after both tasks joined")
+        .into_inner()
+        .expect("std Mutex is never poisoned here (no panics while held)");
+    Ok((status, lines))
+}
+
+/// Materialize `reference` in its isolated worktree, trim its Cargo.toml down
+/// to `selected` components, and `cargo`/`cross build --release --bin ubihome`.
+/// Shared by [`build`] (which then ships the binary) and
+/// [`crate::validate::validate`] (which then runs it as the validator) — same
+/// version + component combo means the same worktree and target dir either
+/// way, so validating and then building (or vice versa) doesn't recompile from
+/// scratch. Serializes against every other build/validate via [`BUILD_LOCK`].
+pub(crate) async fn prepare_and_compile(
+    repo: &Repo,
+    reference: Option<&str>,
+    selected: &[String],
+    target: &Option<String>,
+    use_cross: bool,
+    log: &UnboundedSender<String>,
+) -> Result<(PathBuf, bool, String), BuilderError> {
+    let _guard = BUILD_LOCK.lock().await;
+
+    let _ = log.send("Preparing UbiHome source…".to_string());
+    let reference = repo.resolve(reference)?;
+    let _ = log.send(format!("Using version: {reference}"));
+    let workdir = repo.worktree(&reference, &reference)?;
+
+    let cargo_toml = workdir.join("Cargo.toml");
+    let original = std::fs::read_to_string(&cargo_toml)
+        .map_err(|e| BuilderError::Source(format!("cannot read Cargo.toml: {e}")))?;
+
+    // Validate the selection against what this version can build.
+    let available = platforms::available_components(&cargo_toml)?;
+    for c in selected {
+        if !available.contains(c) {
+            return Err(BuilderError::Config(format!(
+                "config references unknown platform '{c}' for {reference}. Available: {}",
+                available.join(", ")
+            )));
+        }
+    }
+    let _ = log.send(format!(
+        "Selected components: {}",
+        if selected.is_empty() {
+            "none".to_string()
+        } else {
+            selected.join(", ")
+        }
+    ));
+
+    // Trim the throwaway worktree's Cargo.toml.
+    let trimmed = trim_cargo_toml(&original, selected)?;
+    std::fs::write(&cargo_toml, &trimmed)
+        .map_err(|e| BuilderError::Source(format!("cannot write Cargo.toml: {e}")))?;
+
+    let target_label = format!("{reference}-build");
+    let _ = log.send(format!(
+        "$ {} build --release --bin ubihome{}",
+        if use_cross { "cross" } else { "cargo" },
+        target
+            .as_ref()
+            .map(|t| format!(" --target {t}"))
+            .unwrap_or_default()
+    ));
+    let mut cmd = cargo_build_command(repo, &workdir, &target_label, target, use_cross);
+    let child = cmd
+        .spawn()
+        .map_err(|e| BuilderError::Build(format!("failed to start build: {e}")))?;
+    let (status, _lines) = run_streaming(child, log).await?;
+    if !status.success() {
+        return Err(BuilderError::Build(format!(
+            "cargo build failed with status {status}"
+        )));
+    }
+
+    let (built, is_windows) = built_binary(repo, &target_label, target);
+    if !built.is_file() {
+        return Err(BuilderError::Build(format!(
+            "build reported success but artifact not found at {}",
+            built.display()
+        )));
+    }
+
+    Ok((built, is_windows, reference))
 }
 
 /// Path to the `ubihome` binary cargo produced for the given target.
@@ -201,68 +294,15 @@ pub async fn build(
         ));
     }
 
-    let _guard = BUILD_LOCK.lock().await;
-
-    // Resolve and materialize the requested version in an isolated worktree.
-    let _ = log.send("Preparing UbiHome source…".to_string());
-    let reference = opts.repo.resolve(opts.reference.as_deref())?;
-    let _ = log.send(format!("Using version: {reference}"));
-    let workdir = opts.repo.worktree(&reference, &reference)?;
-
-    let cargo_toml = workdir.join("Cargo.toml");
-    let original = std::fs::read_to_string(&cargo_toml)
-        .map_err(|e| BuilderError::Source(format!("cannot read Cargo.toml: {e}")))?;
-
-    // Validate the selection against what this version can build.
-    let available = platforms::available_components(&cargo_toml)?;
-    for c in &selected {
-        if !available.contains(c) {
-            return Err(BuilderError::Config(format!(
-                "config references unknown platform '{c}' for {reference}. Available: {}",
-                available.join(", ")
-            )));
-        }
-    }
-    let _ = log.send(format!("Selected components: {}", selected.join(", ")));
-
-    // Trim the throwaway worktree's Cargo.toml.
-    let trimmed = trim_cargo_toml(&original, &selected)?;
-    std::fs::write(&cargo_toml, &trimmed)
-        .map_err(|e| BuilderError::Source(format!("cannot write Cargo.toml: {e}")))?;
-
-    let target_label = format!("{}-build", reference);
-    let _ = log.send(format!(
-        "$ {} build --release --bin ubihome{}",
-        if opts.use_cross { "cross" } else { "cargo" },
-        opts.target
-            .as_ref()
-            .map(|t| format!(" --target {t}"))
-            .unwrap_or_default()
-    ));
-    let mut cmd = cargo_build_command(
+    let (built, is_windows, reference) = prepare_and_compile(
         &opts.repo,
-        &workdir,
-        &target_label,
+        opts.reference.as_deref(),
+        &selected,
         &opts.target,
         opts.use_cross,
-    );
-    let child = cmd
-        .spawn()
-        .map_err(|e| BuilderError::Build(format!("failed to start build: {e}")))?;
-    let status = run_streaming(child, &log).await?;
-    if !status.success() {
-        return Err(BuilderError::Build(format!(
-            "cargo build failed with status {status}"
-        )));
-    }
-
-    let (built, is_windows) = built_binary(&opts.repo, &target_label, &opts.target);
-    if !built.is_file() {
-        return Err(BuilderError::Build(format!(
-            "build reported success but artifact not found at {}",
-            built.display()
-        )));
-    }
+        &log,
+    )
+    .await?;
 
     // Copy to the output dir under a release-style, version-tagged name.
     // Include a config-name part so different configs don't collide on filename.

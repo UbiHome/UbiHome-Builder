@@ -1,5 +1,7 @@
 # UbiHome Builder
 
+> This is at most ALPHA vibe coded slop for now. I just want to try out the possiblities. So use at your own risk.
+
 An [esphome-builder](https://github.com/esphome/esphome)-style tool for UbiHome.
 Give it a `config.yml` and it compiles a **slim UbiHome binary that contains only
 the platform components your config actually uses** — smaller binary, smaller
@@ -26,7 +28,7 @@ dependencies in the root `Cargo.toml`. For each build the engine:
 1. clones UbiHome (cached) and resolves the requested version (default: latest
    stable tag);
 2. materializes that version as an isolated `git worktree`;
-3. rewrites *that throwaway copy's* `Cargo.toml` to keep `ubihome-core` + only the
+3. rewrites _that throwaway copy's_ `Cargo.toml` to keep `ubihome-core` + only the
    detected components;
 4. runs `cargo build --release` and copies out the binary.
 
@@ -84,7 +86,7 @@ never collide on filename.
 
 - **Dashboard:** every build is a separate history entry with its own
   `data/output/<build-id>/` directory. Editing a config and rebuilding creates a
-  *new* entry — previous builds are preserved and stay downloadable from History.
+  _new_ entry — previous builds are preserved and stay downloadable from History.
 - **CLI:** writes the artifact straight into `-o` with no history, so rebuilding
   the same config+version+target overwrites that file (normal for a CLI). Use a
   different `-o`, or the dashboard, if you want to keep older builds.
@@ -105,12 +107,12 @@ natively with the CLI on that OS.
 
 ## Configuration (env)
 
-| Var | Default | Meaning |
-|---|---|---|
-| `BUILDER_REPO_URL` | official repo | UbiHome git repo (URL or local path) to build from |
-| `BUILDER_WORK` | `./cache` (server) / `$HOME/.cache/ubihome-builder` (CLI) | clone + worktrees + cargo cache |
-| `BUILDER_DATA` | `./data` | configs, outputs, logs, history (server) |
-| `BUILDER_BIND` | `0.0.0.0:8080` | server bind address |
+| Var                | Default                                                   | Meaning                                            |
+| ------------------ | --------------------------------------------------------- | -------------------------------------------------- |
+| `BUILDER_REPO_URL` | official repo                                             | UbiHome git repo (URL or local path) to build from |
+| `BUILDER_WORK`     | `./cache` (server) / `$HOME/.cache/ubihome-builder` (CLI) | clone + worktrees + cargo cache                    |
+| `BUILDER_DATA`     | `./data`                                                  | configs, outputs, logs, history (server)           |
+| `BUILDER_BIND`     | `0.0.0.0:8080`                                            | server bind address                                |
 
 ## Layout
 
@@ -125,18 +127,18 @@ builder/
 
 ## REST API (served under `/api`)
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/api/targets` | feasible compile targets |
-| GET | `/api/versions` | buildable versions (stable tags) |
-| GET/POST | `/api/configs` | list / create configs |
-| GET/PUT/DELETE | `/api/configs/:name` | read / save / delete a config |
-| POST | `/api/configs/:name/validate?ref=` | validate against a version |
-| POST | `/api/configs/:name/duplicate` · `/rename` | manage configs |
-| POST | `/api/configs/:name/build` | start a build (`{target?, ref?}`) → `{build_id}` |
-| GET | `/api/builds` · `/api/builds/:id` | build history |
-| WS | `/api/builds/:id/logs` | live build log stream |
-| GET | `/api/builds/:id/log` · `/api/builds/:id/artifact` | log / download binary |
+| Method         | Path                                               | Purpose                                          |
+| -------------- | -------------------------------------------------- | ------------------------------------------------ |
+| GET            | `/api/targets`                                     | feasible compile targets                         |
+| GET            | `/api/versions`                                    | buildable versions (stable tags)                 |
+| GET/POST       | `/api/configs`                                     | list / create configs                            |
+| GET/PUT/DELETE | `/api/configs/:name`                               | read / save / delete a config                    |
+| POST           | `/api/configs/:name/validate?ref=`                 | validate against a version                       |
+| POST           | `/api/configs/:name/duplicate` · `/rename`         | manage configs                                   |
+| POST           | `/api/configs/:name/build`                         | start a build (`{target?, ref?}`) → `{build_id}` |
+| GET            | `/api/builds` · `/api/builds/:id`                  | build history                                    |
+| WS             | `/api/builds/:id/logs`                             | live build log stream                            |
+| GET            | `/api/builds/:id/log` · `/api/builds/:id/artifact` | log / download binary                            |
 
 ## Development
 

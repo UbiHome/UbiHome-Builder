@@ -19,7 +19,6 @@ pub const DEFAULT_REPO_URL: &str = "https://github.com/UbiHome/UbiHome.git";
 /// <cache_root>/worktrees/<id>  isolated per-version checkouts
 /// <cache_root>/target/<id>     per-version cargo target dirs
 /// <cache_root>/cargo           shared CARGO_HOME
-/// <cache_root>/bin/<ref>       cached validator binaries
 /// ```
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -72,18 +71,6 @@ impl Repo {
     pub fn target_dir(&self, label: &str) -> PathBuf {
         self.cache_root.join("target").join(sanitize(label))
     }
-    pub fn validator_bin(&self, reference: &str) -> PathBuf {
-        let exe = if cfg!(windows) {
-            "ubihome.exe"
-        } else {
-            "ubihome"
-        };
-        self.cache_root
-            .join("bin")
-            .join(sanitize(reference))
-            .join(exe)
-    }
-
     /// Run a git command, returning trimmed stdout or an error with stderr.
     fn git(&self, args: &[&str]) -> Result<String, BuilderError> {
         let out = Command::new("git").args(args).output().map_err(|e| {
@@ -199,9 +186,22 @@ impl Repo {
     pub fn worktree(&self, label: &str, reference: &str) -> Result<PathBuf, BuilderError> {
         let repo = self.repo_dir();
         let repo = repo.to_string_lossy();
-        let wt = self.cache_root.join("worktrees").join(sanitize(label));
-        std::fs::create_dir_all(wt.parent().unwrap())
+        let wt_parent = self.cache_root.join("worktrees");
+        std::fs::create_dir_all(&wt_parent)
             .map_err(|e| BuilderError::Source(format!("cannot create worktrees dir: {e}")))?;
+        // Must be absolute: `git -C <repo> worktree add ... <wt>` resolves a
+        // relative <wt> against <repo>, not the process cwd, which silently
+        // nests the checkout under the clone itself for a relative cache root
+        // (the default `./cache`). Join onto cwd rather than `canonicalize`,
+        // which on Windows returns a `\\?\`-prefixed path that git rejects.
+        let wt_parent = if wt_parent.is_absolute() {
+            wt_parent
+        } else {
+            std::env::current_dir()
+                .map_err(|e| BuilderError::Source(format!("cannot resolve current dir: {e}")))?
+                .join(&wt_parent)
+        };
+        let wt = wt_parent.join(sanitize(label));
         let wt_str = wt.to_string_lossy().to_string();
 
         if wt.join("Cargo.toml").exists() {

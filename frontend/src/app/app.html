@@ -62,12 +62,16 @@
                 }
               </select>
               <button class="ghost" (click)="save()">Save</button>
-              <button (click)="validate()" [disabled]="validating()">
+              <button (click)="validate()" [disabled]="active()">
                 {{ validating() ? 'Validating…' : 'Validate' }}
               </button>
-              <button class="primary" (click)="build()" [disabled]="building() || detected().length === 0">
-                {{ building() ? 'Building…' : 'Build ▶' }}
-              </button>
+              @if (canDownloadInsteadOfBuild()) {
+                <a class="primary" [href]="artifactUrl(lastSuccessfulBuild()!.buildId)">Download ⬇</a>
+              } @else {
+                <button class="primary" (click)="build()" [disabled]="active() || detected().length === 0">
+                  {{ building() ? 'Building…' : 'Build ▶' }}
+                </button>
+              }
             </div>
           </div>
 
@@ -93,24 +97,8 @@
                 </div>
               </div>
 
-              @if (validation(); as v) {
-                <div class="panel" [class.ok]="v.ok" [class.bad]="!v.ok">
-                  <h3>{{ v.ok ? '✔ Valid' : '✕ Invalid' }}</h3>
-                  @if (v.output) {
-                    <pre class="validate-out">{{ v.output }}</pre>
-                  }
-                </div>
-              }
             </div>
           </div>
-
-          @if (logLines().length > 0) {
-            <div class="logs">
-              <h3>Build log</h3>
-              <pre class="log-out">@for (l of logLines(); track $index) {{{ l }}
-}</pre>
-            </div>
-          }
         } @else {
           <div class="empty-state big">Select a config on the left, or create a new one.</div>
         }
@@ -157,5 +145,37 @@
         </tbody>
       </table>
     </main>
+  }
+
+  @if (active() || logLines().length > 0) {
+    <footer class="console" [class.collapsed]="logCollapsed()">
+      <div class="console-head" (click)="logCollapsed.set(!logCollapsed())">
+        <div class="console-title">
+          <span>{{ kind() === 'validate' ? 'Validate output' : 'Build output' }}</span>
+          @if (active()) {
+            <span class="status running">● {{ kind() === 'validate' ? 'Validating' : 'Building' }}…</span>
+          } @else if (runStatus() === 'success' || runStatus() === 'valid') {
+            <span class="status success">✔ {{ runStatus() === 'valid' ? 'Valid' : 'Success' }}</span>
+          } @else if (runStatus() === 'failed' || runStatus() === 'invalid') {
+            <span class="status failed">✕ {{ runStatus() === 'invalid' ? 'Invalid' : 'Failed' }}</span>
+          } @else if (runStatus() === 'error') {
+            <span class="status failed">⚠ Error</span>
+          }
+        </div>
+        <div class="console-actions">
+          <button
+            class="ghost"
+            (click)="logCollapsed.set(!logCollapsed()); $event.stopPropagation()"
+          >
+            {{ logCollapsed() ? '▲ Expand' : '▼ Collapse' }}
+          </button>
+          <button class="ghost" [disabled]="active()" (click)="clearLog($event)">Clear</button>
+        </div>
+      </div>
+      @if (!logCollapsed()) {
+        <pre class="console-body" #logBox>@for (l of logLines(); track $index) {{{ l }}
+}</pre>
+      }
+    </footer>
   }
 </div>

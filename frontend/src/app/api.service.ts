@@ -22,11 +22,6 @@ export interface ConfigDetail {
   components: string[];
 }
 
-export interface ValidationResult {
-  ok: boolean;
-  output: string;
-}
-
 export interface BuildRecord {
   id: number;
   config: string;
@@ -92,14 +87,21 @@ export class ApiService {
     );
   }
 
-  validate(name: string, ref: string | null) {
+  /** Start a validation; the client streams progress over the returned id's WebSocket. */
+  startValidate(name: string, ref: string | null) {
     const q = ref ? `?ref=${encodeURIComponent(ref)}` : '';
     return firstValueFrom(
-      this.http.post<ValidationResult>(
+      this.http.post<{ validate_id: number }>(
         `/api/configs/${encodeURIComponent(name)}/validate${q}`,
         {},
       ),
     );
+  }
+
+  /** Open a WebSocket that streams a validation's progress. */
+  openValidateLogSocket(id: number): WebSocket {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    return new WebSocket(`${proto}://${location.host}/api/validations/${id}/logs`);
   }
 
   startBuild(name: string, target: string | null, ref: string | null) {

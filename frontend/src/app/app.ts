@@ -1,12 +1,18 @@
-import { Component, OnInit, computed, inject, signal } from '@angular/core';
-import { FormsModule } from '@angular/forms';
 import {
-  ApiService,
-  BuildRecord,
-  ConfigInfo,
-  Target,
-  ValidationResult,
-} from './api.service';
+  Component,
+  ElementRef,
+  OnInit,
+  ViewChild,
+  computed,
+  effect,
+  inject,
+  signal,
+} from '@angular/core';
+import { FormsModule } from '@angular/forms';
+import { ApiService, BuildRecord, ConfigInfo, Target } from './api.service';
+
+type RunKind = 'build' | 'validate';
+type RunStatus = 'success' | 'failed' | 'valid' | 'invalid' | 'error';
 
 /** Base-config keys that are NOT platform components.
  *  Mirror of `RESERVED` in engine/src/platforms.rs (BaseConfig fields). */
@@ -63,15 +69,57 @@ export class App implements OnInit {
   selectedTarget = signal<string>(''); // '' == native host
   selectedVersion = signal<string>(''); // '' == latest stable
 
-  validation = signal<ValidationResult | null>(null);
-  validating = signal(false);
-
-  building = signal(false);
+  /** Which action (if any) is currently streaming into the console. */
+  active = signal(false);
+  /** Which action populated the console — persists after `active` goes false
+   *  so the console can still show what it's reporting on. */
+  kind = signal<RunKind | null>(null);
+  runStatus = signal<RunStatus | null>(null);
   logLines = signal<string[]>([]);
+  logCollapsed = signal(false);
   banner = signal<string | null>(null);
+
+  /** Snapshot of the config/params that produced the most recent successful
+   *  build, so we can offer Download instead of re-running an identical build. */
+  lastSuccessfulBuild = signal<{
+    config: string;
+    content: string;
+    target: string;
+    version: string;
+    buildId: number;
+  } | null>(null);
+
+  building = computed(() => this.active() && this.kind() === 'build');
+  validating = computed(() => this.active() && this.kind() === 'validate');
+
+  /** True while the editor's config/target/version still match the last
+   *  successful build — nothing to rebuild, only to download. */
+  canDownloadInsteadOfBuild = computed(() => {
+    const lb = this.lastSuccessfulBuild();
+    if (!lb) return false;
+    return (
+      lb.config === this.selected() &&
+      lb.content === this.content() &&
+      lb.target === this.selectedTarget() &&
+      lb.version === this.selectedVersion()
+    );
+  });
+
+  @ViewChild('logBox') logBox?: ElementRef<HTMLPreElement>;
 
   /** Live component detection from the editor content. */
   detected = computed(() => detectPlatforms(this.content()));
+
+  constructor() {
+    // Keep the console pinned to the latest line as it streams in.
+    effect(() => {
+      this.logLines();
+      queueMicrotask(() => {
+        const el = this.logBox?.nativeElement;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    });
+  }
 
   async ngOnInit() {
     await this.refreshConfigs();
@@ -100,8 +148,9 @@ export class App implements OnInit {
     const detail = await this.api.getConfig(name);
     this.selected.set(name);
     this.content.set(detail.content);
-    this.validation.set(null);
     this.logLines.set([]);
+    this.runStatus.set(null);
+    this.kind.set(null);
     this.view.set('editor');
   }
 
@@ -144,18 +193,42 @@ export class App implements OnInit {
     await this.refreshConfigs();
   }
 
+  /** Reset console state and open it for a fresh build/validate run. */
+  private startRun(k: RunKind) {
+    this.kind.set(k);
+    this.active.set(true);
+    this.runStatus.set(null);
+    this.logLines.set([]);
+    this.logCollapsed.set(false);
+  }
+
   async validate() {
     const name = this.selected();
     if (!name) return;
     await this.save();
-    this.validating.set(true);
-    this.validation.set(null);
+    this.startRun('validate');
     try {
-      this.validation.set(await this.api.validate(name, this.selectedVersion() || null));
+      const { validate_id } = await this.api.startValidate(name, this.selectedVersion() || null);
+      const ws = this.api.openValidateLogSocket(validate_id);
+      ws.onmessage = (ev) => {
+        const line = ev.data as string;
+        const done = /^\[validate (valid|invalid|error)\]$/.exec(line);
+        if (done) {
+          this.runStatus.set(done[1] as RunStatus);
+        }
+        this.logLines.update((lines) => [...lines, line]);
+      };
+      ws.onclose = () => {
+        this.active.set(false);
+      };
+      ws.onerror = () => {
+        this.logLines.update((l) => [...l, '[log stream error]']);
+        this.active.set(false);
+      };
     } catch (e: any) {
-      this.validation.set({ ok: false, output: e?.error?.error ?? String(e) });
-    } finally {
-      this.validating.set(false);
+      this.logLines.update((l) => [...l, 'ERROR: ' + (e?.error?.error ?? String(e))]);
+      this.active.set(false);
+      this.runStatus.set('error');
     }
   }
 
@@ -163,30 +236,49 @@ export class App implements OnInit {
     const name = this.selected();
     if (!name) return;
     await this.save();
-    this.building.set(true);
-    this.logLines.set([]);
+    // Snapshot the params that this build actually uses — the editor stays
+    // live during the build, so re-reading the signals at completion could
+    // pick up edits made mid-build.
+    const target = this.selectedTarget();
+    const version = this.selectedVersion();
+    const content = this.content();
+    this.startRun('build');
     try {
-      const { build_id } = await this.api.startBuild(
-        name,
-        this.selectedTarget() || null,
-        this.selectedVersion() || null,
-      );
+      const { build_id } = await this.api.startBuild(name, target || null, version || null);
       const ws = this.api.openLogSocket(build_id);
       ws.onmessage = (ev) => {
-        this.logLines.update((lines) => [...lines, ev.data as string]);
+        const line = ev.data as string;
+        const done = /^\[build (success|failed)\]$/.exec(line);
+        if (done) {
+          this.runStatus.set(done[1] as RunStatus);
+        }
+        this.logLines.update((lines) => [...lines, line]);
       };
       ws.onclose = async () => {
-        this.building.set(false);
+        this.active.set(false);
+        if (this.runStatus() === 'success') {
+          this.lastSuccessfulBuild.set({ config: name, content, target, version, buildId: build_id });
+        }
         await this.refreshBuilds();
       };
       ws.onerror = () => {
         this.logLines.update((l) => [...l, '[log stream error]']);
-        this.building.set(false);
+        this.active.set(false);
       };
     } catch (e: any) {
       this.logLines.update((l) => [...l, 'ERROR: ' + (e?.error?.error ?? String(e))]);
-      this.building.set(false);
+      this.active.set(false);
+      this.runStatus.set('failed');
     }
+  }
+
+  /** Dismiss the console. No-op while a build/validate is still streaming. */
+  clearLog(ev: Event) {
+    ev.stopPropagation();
+    if (this.active()) return;
+    this.logLines.set([]);
+    this.runStatus.set(null);
+    this.kind.set(null);
   }
 
   async refreshBuilds() {

@@ -1,0 +1,41 @@
+# UbiHome Builder CLI image — just the CLI, no web dashboard/frontend.
+#
+# Fully decoupled from the UbiHome repository: it CLONES UbiHome on demand at
+# runtime and builds any tagged version in an isolated git worktree.
+#   docker build -f Dockerfile.cli -t ubihome-builder-cli .
+#
+# Usage (mount your config + an output dir, and a cache volume for speed):
+#   docker run --rm \
+#     -v "$PWD:/data" \
+#     -v ubihome-builder-cli-cache:/cache \
+#     ubihome-builder-cli build -c /data/config.yml -o /data/output
+#
+# Any subcommand works the same way, e.g.:
+#   docker run --rm -v "$PWD:/data" ubihome-builder-cli detect -c /data/config.yml
+
+# ---- Stage 1: build the CLI -------------------------------------------------
+FROM rust:1-slim-bookworm AS backend
+WORKDIR /b
+COPY Cargo.toml Cargo.lock ./
+COPY engine ./engine
+COPY cli ./cli
+COPY server ./server
+RUN cargo build --release -p ubihome-builder
+
+# ---- Stage 2: runtime --------------------------------------------------------
+FROM rust:1-slim-bookworm AS runtime
+# git: clone UbiHome at runtime. dev libs: needed to compile UbiHome's components.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       pkg-config libdbus-1-dev libasound2-dev git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=backend /b/target/release/ubihome-builder /usr/local/bin/ubihome-builder
+
+ENV BUILDER_WORK=/cache \
+    BUILDER_REPO_URL=https://github.com/UbiHome/UbiHome.git
+
+VOLUME ["/cache"]
+WORKDIR /data
+ENTRYPOINT ["ubihome-builder"]
+CMD ["--help"]

@@ -115,10 +115,18 @@ async fn main() -> anyhow::Result<()> {
         Command::Validate { config, r#ref } => {
             let content = std::fs::read_to_string(config)?;
             let repo = cli.repo();
-            let result = engine::validate_config(&repo, r#ref.as_deref(), &content).await?;
-            if !result.output.is_empty() {
-                println!("{}", result.output);
-            }
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let printer = tokio::spawn(async move {
+                while let Some(line) = rx.recv().await {
+                    println!("{line}");
+                }
+            });
+
+            let result = engine::validate_config(&repo, r#ref.as_deref(), &content, tx).await;
+            let _ = printer.await;
+            let result = result?;
+
             if result.ok {
                 println!("✔ config is valid (against {})", result.version);
             } else {
